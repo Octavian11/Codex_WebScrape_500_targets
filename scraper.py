@@ -95,6 +95,20 @@ def domain_from_url(url: str) -> str:
         return url.lower()
 
 
+def normalize_url(href: str, base_url: str) -> str:
+    """Convert relative and protocol-relative URLs to absolute."""
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("//"):
+        return f"https:{href}"
+    if href.startswith("mailto:"):
+        return ""
+    return urljoin(base_url, href)
+
+
 def clean_result_name(title: str, domain_fallback: str) -> str:
     """
     Strip common site-brand suffixes. Prefer returning the brand segment if it
@@ -275,6 +289,35 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
+def fetch_html_headless(url: str, wait_selector: str = None, wait_ms: int = 3000) -> str:
+    """
+    Optional headless fetch using Playwright (if installed).
+    Falls back to regular fetch_html on errors/import issues.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return fetch_html(url)
+
+    html = ""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            if wait_selector:
+                try:
+                    page.wait_for_selector(wait_selector, timeout=wait_ms)
+                except Exception:
+                    pass
+            time.sleep(wait_ms / 1000.0)
+            html = page.content()
+            browser.close()
+    except Exception:
+        return fetch_html(url)
+    return html
+
+
 def parse_fia_expo(html: str, conf_name: str) -> List[dict]:
     """
     Parser for FIA Expo sponsor/exhibitor list:
@@ -437,6 +480,554 @@ def run_conference_scrape(output_csv: str = "data/firms_raw_conferences.csv", ma
 
     print(f"[CONF] Wrote {len(all_rows)} rows to {output_csv}")
 
+
+# ===============================
+# DISCOVERY – DIRECTORIES (new)
+# ===============================
+
+@dataclass
+class DirectorySource:
+    name: str
+    url: str
+    source_label: str
+    note: str = ""
+
+
+DIR_SOURCES: List[DirectorySource] = [
+    DirectorySource(
+        name="CME_Licensed_Distributors",
+        url="https://www.cmegroup.com/market-data/license-data/licensed-market-data-distributors.html",
+        source_label="dir:CME_Licensed_Distributors",
+        note="Market data / connectivity / trading tech distributors",
+    ),
+    DirectorySource(
+        name="CME_EBS_Vendor_Partners",
+        url="https://www.cmegroup.com/markets/ebs/ebs-vendor-partners.html",
+        source_label="dir:CME_EBS_Vendor_Partners",
+        note="FX trading infra / market data / OMS/EMS vendors",
+    ),
+    DirectorySource(
+        name="ISITC_Member_Firms",
+        url="https://isitc.org/membership/member-firms/",
+        source_label="dir:ISITC_Member_Firms",
+        note="Securities ops/standards ecosystem",
+    ),
+    DirectorySource(
+        name="CME_TVS",
+        url="https://www.cmegroup.com/solutions/market-tech-and-data-services/technology-vendor-services.html",
+        source_label="dir:CME_TVS",
+        note="CME Technology Vendor Services directory",
+    ),
+    DirectorySource(
+        name="SIFMA_Sources_Companies",
+        url="https://sources.sifma.org/search?ContentType=Suppliers&DemographicsSubCategoryId=&Distance=0&FreeTextSearch=&Latitude=0&ListingType=Companies&ListingTypeId=e74b1462-1188-4954-8af1-99eba28e0ac7&Longitude=0&MemberPerks=false&OpenStore=false&ReferFriendCampaign=false&SortBy=Featured&SubCategoryId=&View=Card",
+        source_label="dir:SIFMA_Sources_Companies",
+        note="SIFMA Sources supplier marketplace",
+    ),
+    DirectorySource(
+        name="FIX_Member_Firms",
+        url="https://www.fixtrading.org/member-firms/",
+        source_label="dir:FIX_Member_Firms",
+        note="FIX Trading Community members",
+    ),
+    DirectorySource(
+        name="FIA_Boca_2024",
+        url="https://s7.goeshow.com/fia/boca/2024/sponsor_exhibitor_list.cfm",
+        source_label="dir:FIA_Boca_2024",
+        note="FIA Boca sponsors/exhibitors",
+    ),
+    DirectorySource(
+        name="FIA_SIFMA_2024",
+        url="https://s7.goeshow.com/fia/sifma/2024/sponsor_exhibitor_list.cfm",
+        source_label="dir:FIA_SIFMA_2024",
+        note="FIA/SIFMA sponsors/exhibitors",
+    ),
+    DirectorySource(
+        name="TradeTech_Europe_2025",
+        url="https://tradetecheu.wbresearch.com/sponsors",
+        source_label="dir:TradeTech_Europe_2025",
+        note="TradeTech Europe sponsors",
+    ),
+    DirectorySource(
+        name="TradeTech_FX_Europe_2024",
+        url="https://tradetechfx.wbresearch.com/sponsors/2024",
+        source_label="dir:TradeTech_FX_Europe_2024",
+        note="TradeTech FX Europe sponsors",
+    ),
+    DirectorySource(
+        name="Advent_Alliance_Partners",
+        url="https://www.advent.com/about/partners/",
+        source_label="dir:Advent_Alliance_Partners",
+        note="Advent alliance partners",
+    ),
+    DirectorySource(
+        name="Advent_Portfolio_Data_Partners",
+        url="https://www.advent.com/about/partners/custodial-data-partners/",
+        source_label="dir:Advent_Portfolio_Data_Partners",
+        note="Advent custodial/portfolio data partners",
+    ),
+]
+
+
+def parse_cme_licensed_distributors(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    # This page is mostly a list of vendor <a> tags; filter out obvious nav/social links.
+    for a in soup.find_all("a", href=True):
+        name = a.get_text(strip=True)
+        href = a["href"]
+        if not name or not href:
+            continue
+        name_lower = name.lower()
+        if any(skip in name_lower for skip in [
+            "privacy", "cookie", "terms", "cme group", "facebook", "twitter",
+            "linkedin", "youtube", "instagram", "google", "apple", "android"
+        ]):
+            continue
+        website = normalize_url(href, src.url)
+        if not website:
+            continue
+        domain = domain_from_url(website)
+        if domain in seen:
+            continue
+        seen.add(domain)
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_cme_ebs_vendor_partners(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    # Partner headings are h2/h3 with <a> inside; collect following siblings as description.
+    for heading in soup.find_all(["h2", "h3"]):
+        a = heading.find("a", href=True)
+        if not a or not a.get_text(strip=True):
+            continue
+        name = a.get_text(strip=True)
+        website = normalize_url(a["href"], src.url)
+        desc_parts = []
+        for sib in heading.next_siblings:
+            if getattr(sib, "name", None) in ("h2", "h3"):
+                break
+            if getattr(sib, "get_text", None):
+                txt = sib.get_text(" ", strip=True)
+                if txt:
+                    desc_parts.append(txt)
+        notes = " ".join(desc_parts)
+        domain = domain_from_url(website) if website else ""
+        if domain and domain in seen:
+            continue
+        if domain:
+            seen.add(domain)
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": notes or src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_isitc_member_firms(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    header = None
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        if "member firms" in h.get_text(strip=True).lower():
+            header = h
+            break
+    if not header:
+        return rows
+    ul = header.find_next("ul")
+    if not ul:
+        return rows
+    seen = set()
+    for li in ul.find_all("li"):
+        name = li.get_text(strip=True)
+        if not name:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        rows.append({
+            "Name": name,
+            "Website": "",
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_fix_member_firms(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    for item in soup.select("div.item"):
+        title = item.select_one(".item-title a")
+        if not title:
+            continue
+        name = title.get_text(strip=True)
+        if not name:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        website = normalize_url(title.get("href", ""), src.url)
+        desc_el = item.select_one(".item-meta")
+        notes = desc_el.get_text(" ", strip=True) if desc_el else src.note
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": notes,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_goeshow_table(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    table = soup.find("table")
+    if not table:
+        return rows
+    trs = table.find_all("tr")
+    for tr in trs[1:]:
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        booth = tds[0].get_text(" ", strip=True)
+        company_td = tds[-1]
+        name = company_td.get_text(" ", strip=True)
+        if not name:
+            continue
+        website = ""
+        link = company_td.find("a", href=True)
+        if link:
+            website = normalize_url(link["href"], src.url)
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": f"Booth/Role: {booth}" if booth else src.note,
+            "Source": src.source_label,
+            "Conference": src.name,
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_wbresearch_sponsors(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    cards = soup.select("div.sponsor")
+    for c in cards:
+        name_el = c.find(["h3", "h2", "h4"])
+        name = name_el.get_text(strip=True) if name_el else ""
+        if not name:
+            img = c.find("img", alt=True)
+            if img:
+                name = img["alt"].strip()
+        if not name:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        website = ""
+        link = c.find("a", href=True)
+        if link:
+            website = normalize_url(link["href"], src.url)
+        tier_el = None
+        for el in c.find_all(["span", "div"]):
+            cls = " ".join(el.get("class", [])) if el.get("class") else ""
+            if "tier" in cls.lower():
+                tier_el = el
+                break
+        notes = tier_el.get_text(" ", strip=True) if tier_el else src.note
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": notes,
+            "Source": src.source_label,
+            "Conference": src.name,
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_cme_tvs(html: str, src: DirectorySource) -> List[dict]:
+    """
+    Best-effort parser for CME Technology Vendor Services.
+    The page appears to be highly dynamic; we attempt to capture any links that
+    contain 'technology-vendor-services/' and treat them as vendor pages.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "technology-vendor-services/" in href and not href.endswith("technology-vendor-services.html"):
+            links.add(normalize_url(href, src.url))
+    for link in links:
+        domain = domain_from_url(link)
+        if domain in seen:
+            continue
+        seen.add(domain)
+        rows.append({
+            "Name": link,
+            "Website": link,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_sifma_sources(html: str, src: DirectorySource) -> List[dict]:
+    """
+    Attempt to scrape SIFMA Sources cards; structure may be JS-driven so this may return few/none.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    cards = soup.select("div.company-card, div.card, div.listing")
+    for card in cards:
+        name_el = card.find(["h3", "h2", "strong", "b"])
+        if not name_el:
+            continue
+        name = name_el.get_text(strip=True)
+        if not name:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        website = ""
+        for a in card.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("#") or href.startswith("mailto:"):
+                continue
+            website = normalize_url(href, src.url)
+            break
+        desc_el = card.find("p")
+        notes = desc_el.get_text(" ", strip=True) if desc_el else src.note
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": notes,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_advent_alliance(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    # Look for cards that may hold partner info; if none, fallback to anchor links in main content.
+    cards = soup.select("div.partner-card, div.partner, li.partner")
+    if not cards:
+        cards = soup.select("main a")
+    for card in cards:
+        name = ""
+        website = ""
+        if hasattr(card, "find"):
+            name_el = card.find(["h3", "h2", "h4"])
+            if not name_el and getattr(card, "name", "") == "a":
+                name_el = card
+            if not name_el:
+                img = card.find("img", alt=True) if hasattr(card, "find") else None
+                if img:
+                    name_el = img
+            if name_el:
+                name = name_el.get_text(strip=True) if name_el.name != "img" else name_el["alt"].strip()
+            link_el = card.find("a", href=True) if hasattr(card, "find") else None
+            if link_el:
+                website = normalize_url(link_el["href"], src.url)
+        if not name and getattr(card, "name", "") == "a":
+            name = card.get_text(strip=True)
+            website = normalize_url(card.get("href", ""), src.url)
+        if not name:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        rows.append({
+            "Name": name,
+            "Website": website,
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def parse_advent_portfolio_data(html: str, src: DirectorySource) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    seen = set()
+    table = soup.find("table")
+    if table:
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            name = tds[0].get_text(strip=True)
+            if not name:
+                continue
+            name_lower = name.lower()
+            if name_lower in seen:
+                continue
+            seen.add(name_lower)
+            rows.append({
+                "Name": name,
+                "Website": "",
+                "HQ": "",
+                "Category": "",
+                "Fit (Core/Stretch)": "",
+                "Notes": src.note,
+                "Source": src.source_label,
+                "Conference": "",
+                "Classification": "",
+            })
+        return rows
+    # Fallback: list items
+    for li in soup.find_all("li"):
+        name = li.get_text(strip=True)
+        if not name or len(name.split()) < 1:
+            continue
+        name_lower = name.lower()
+        if name_lower in seen:
+            continue
+        seen.add(name_lower)
+        rows.append({
+            "Name": name,
+            "Website": "",
+            "HQ": "",
+            "Category": "",
+            "Fit (Core/Stretch)": "",
+            "Notes": src.note,
+            "Source": src.source_label,
+            "Conference": "",
+            "Classification": "",
+        })
+    return rows
+
+
+def run_directory_scrape(output_csv: str = "data/firms_raw_directories.csv", max_rows: int = None, use_headless: bool = False) -> None:
+    """
+    Scrape directory-style sources (CME, ISITC, etc.) and write to CSV.
+    """
+    ensure_dir(output_csv)
+    all_rows: List[dict] = []
+
+    for src in DIR_SOURCES:
+        print(f"[DIR] Scraping {src.name} from {src.url}")
+        try:
+            # Use headless fetch for dynamic-heavy sources
+            if use_headless and ("CME_TVS" in src.name or "SIFMA_Sources_Companies" in src.name or "Advent_" in src.name):
+                html = fetch_html_headless(src.url)
+            else:
+                html = fetch_html(src.url)
+            if "CME_Licensed_Distributors" in src.name:
+                rows = parse_cme_licensed_distributors(html, src)
+            elif "CME_EBS_Vendor_Partners" in src.name:
+                rows = parse_cme_ebs_vendor_partners(html, src)
+            elif "ISITC_Member_Firms" in src.name:
+                rows = parse_isitc_member_firms(html, src)
+            elif "FIX_Member_Firms" in src.name:
+                rows = parse_fix_member_firms(html, src)
+            elif src.name in {"FIA_Boca_2024", "FIA_SIFMA_2024"}:
+                rows = parse_goeshow_table(html, src)
+            elif src.name in {"TradeTech_Europe_2025", "TradeTech_FX_Europe_2024"}:
+                rows = parse_wbresearch_sponsors(html, src)
+            elif "CME_TVS" in src.name:
+                rows = parse_cme_tvs(html, src)
+            elif "SIFMA_Sources_Companies" in src.name:
+                rows = parse_sifma_sources(html, src)
+            elif "Advent_Alliance_Partners" in src.name:
+                rows = parse_advent_alliance(html, src)
+            elif "Advent_Portfolio_Data_Partners" in src.name:
+                rows = parse_advent_portfolio_data(html, src)
+            else:
+                rows = []
+            all_rows.extend(rows)
+            print(f"[DIR] {src.name}: {len(rows)} rows scraped")
+            if max_rows and len(all_rows) >= max_rows:
+                print(f"[DIR] Reached max_rows={max_rows}; stopping directory scrape.")
+                break
+        except Exception as e:
+            print(f"[!] Error scraping {src.name}: {e}")
+        if max_rows and len(all_rows) >= max_rows:
+            break
+
+    if max_rows and len(all_rows) > max_rows:
+        all_rows = all_rows[:max_rows]
+
+    if not all_rows:
+        print("[DIR] No directory rows scraped.")
+        return
+
+    fieldnames = [
+        "Name", "Website", "HQ", "Category", "Fit (Core/Stretch)",
+        "Notes", "Source", "Conference", "Classification"
+    ]
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"[DIR] Wrote {len(all_rows)} rows to {output_csv}")
 
 # ===============================
 # ENRICHMENT & CLASSIFICATION
@@ -768,6 +1359,7 @@ def enrich(input_csv: str, output_csv: str) -> None:
 def merge_raw_sources(
     search_csv: str = "data/firms_raw_search.csv",
     conf_csv: str = "data/firms_raw_conferences.csv",
+    dir_csv: str = "data/firms_raw_directories.csv",
     output_csv: str = "data/firms_raw_all.csv",
     max_total_rows: int = None,
 ) -> None:
@@ -783,7 +1375,7 @@ def merge_raw_sources(
 
     if pd is not None:
         frames = []
-        for path in (search_csv, conf_csv):
+        for path in (search_csv, conf_csv, dir_csv):
             if not os.path.exists(path):
                 print(f"[MERGE] File not found, skipping: {path}")
                 continue
@@ -843,6 +1435,7 @@ def merge_raw_sources(
 
     load(search_csv)
     load(conf_csv)
+    load(dir_csv)
 
     if not all_rows:
         print("[MERGE] No rows to merge.")
@@ -877,18 +1470,25 @@ def main():
                         help="Limit number of rows collected from web search (<=0 for unlimited).")
     parser.add_argument("--max-conf-rows", type=int, default=10,
                         help="Limit number of rows collected from conference scraping (<=0 for unlimited).")
+    parser.add_argument("--max-dir-rows", type=int, default=10,
+                        help="Limit number of rows collected from directory scraping (<=0 for unlimited).")
     parser.add_argument("--max-total-rows", type=int, default=None,
                         help="Cap total merged rows before enrichment (<=0 for unlimited).")
+    parser.add_argument("--headless", action="store_true",
+                        help="Use headless browser (if available) for dynamic sources.")
     parser.add_argument("--skip-search", action="store_true",
                         help="Skip search-based discovery.")
     parser.add_argument("--skip-conferences", action="store_true",
                         help="Skip conference scraping.")
+    parser.add_argument("--skip-directories", action="store_true",
+                        help="Skip directory scraping.")
     parser.add_argument("--skip-enrich", action="store_true",
                         help="Skip enrichment step.")
     args = parser.parse_args()
 
     max_search = None if (args.max_search_rows is not None and args.max_search_rows <= 0) else args.max_search_rows
     max_conf = None if (args.max_conf_rows is not None and args.max_conf_rows <= 0) else args.max_conf_rows
+    max_dir = None if (args.max_dir_rows is not None and args.max_dir_rows <= 0) else args.max_dir_rows
 
     if not args.skip_search:
         run_search_discovery(
@@ -902,9 +1502,17 @@ def main():
             max_rows=max_conf,
         )
 
+    if not args.skip_directories:
+        run_directory_scrape(
+            output_csv="data/firms_raw_directories.csv",
+            max_rows=max_dir,
+            use_headless=args.headless,
+        )
+
     merge_raw_sources(
         search_csv="data/firms_raw_search.csv",
         conf_csv="data/firms_raw_conferences.csv",
+        dir_csv="data/firms_raw_directories.csv",
         output_csv="data/firms_raw_all.csv",
         max_total_rows=None if (args.max_total_rows is not None and args.max_total_rows <= 0) else args.max_total_rows,
     )
